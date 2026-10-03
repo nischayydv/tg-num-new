@@ -1,9 +1,12 @@
 import asyncio
+import datetime
+import decimal
 import json
 import logging
 import os
 import traceback
 from typing import List
+from uuid import UUID
 
 import duckdb
 import gradio as gr
@@ -11,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ── Logging (so errors appear in Vercel function logs) ─────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tgnew")
 
@@ -27,6 +30,10 @@ PARQUET_URL = (
 
 SEARCH_FIELDS = ["user_id", "phone"]
 
+# Columns we actually select, with indexed_at cast to VARCHAR so it's JSON-safe
+SELECT_COLS = "user_id, phone, CAST(indexed_at AS VARCHAR) AS indexed_at"
+
+
 # ── DuckDB setup ────────────────────────────────────────────────────────────
 def _new_conn() -> duckdb.DuckDBPyConnection:
     """
@@ -38,14 +45,14 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
 
     con = duckdb.connect()
 
-    # ── Point EVERYTHING to /tmp ────────────────────────────────────────
+    # Point everything to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_ext'")
     con.execute("SET temp_directory='/tmp/duckdb_temp'")
     con.execute("SET threads=2")
     con.execute("SET memory_limit='256MB'")
 
-    # ── Install + load extensions ───────────────────────────────────────
+    # Install + load extensions
     try:
         con.execute("INSTALL httpfs;")
         con.execute("LOAD httpfs;")
@@ -60,7 +67,7 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
         logger.error(f"Failed to install/load parquet: {e}")
         raise
 
-    # ── Optional HF token ───────────────────────────────────────────────
+    # Optional HF token
     token = os.environ.get("HF_TOKEN")
     if token:
         try:
@@ -71,7 +78,7 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
         except Exception as e:
             logger.warning(f"HF secret creation failed: {e}")
 
-    # ── Create the view ─────────────────────────────────────────────────
+    # Create the view
     con.execute(
         f"CREATE OR REPLACE VIEW people AS "
         f"SELECT * FROM read_parquet('{PARQUET_URL}')"
@@ -89,13 +96,38 @@ def _rows_to_dicts(con, rows) -> List[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
-# ── Query functions (each opens its own connection) ─────────────────────────
+def _json_default(o):
+    """Convert types json.dumps can't handle."""
+    if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+        return o.isoformat()
+    if isinstance(o, datetime.timedelta):
+        return str(o)
+    if isinstance(o, decimal.Decimal):
+        return float(o)
+    if isinstance(o, UUID):
+        return str(o)
+    if isinstance(o, bytes):
+        return o.decode("utf-8", errors="replace")
+    return str(o)
+
+
+def _dumps(obj, pretty: bool = False) -> str:
+    """json.dumps that handles datetime/Decimal/UUID/bytes."""
+    return json.dumps(
+        obj,
+        indent=2 if pretty else None,
+        ensure_ascii=False,
+        default=_json_default,
+    )
+
+
+# ── Query functions ─────────────────────────────────────────────────────────
 def lookup_by_user_id(user_id: str, limit: int = 20) -> dict:
     uid = _escape(str(user_id).strip())
     con = _new_conn()
     try:
         sql = (
-            f"SELECT user_id, phone, indexed_at FROM people "
+            f"SELECT {SELECT_COLS} FROM people "
             f"WHERE CAST(user_id AS VARCHAR) = '{uid}' LIMIT {limit}"
         )
         rows = _rows_to_dicts(con, con.execute(sql).fetchall())
@@ -122,7 +154,7 @@ def lookup_by_phone(phone: str, limit: int = 20) -> dict:
     con = _new_conn()
     try:
         sql = (
-            f"SELECT user_id, phone, indexed_at FROM people "
+            f"SELECT {SELECT_COLS} FROM people "
             f"WHERE CAST(phone AS VARCHAR) = '{p}' LIMIT {limit}"
         )
         rows = _rows_to_dicts(con, con.execute(sql).fetchall())
@@ -155,7 +187,7 @@ def unified_search(q: str, limit: int = 20) -> dict:
             f"CAST(user_id AS VARCHAR) ILIKE '%{v}%' "
             f"OR CAST(phone AS VARCHAR) ILIKE '%{v}%'"
         )
-        sql = f"SELECT user_id, phone, indexed_at FROM people WHERE {where} LIMIT {limit}"
+        sql = f"SELECT {SELECT_COLS} FROM people WHERE {where} LIMIT {limit}"
         rows = _rows_to_dicts(con, con.execute(sql).fetchall())
     finally:
         con.close()
@@ -169,12 +201,13 @@ def field_search(field: str, value: str, mode: str, limit: int) -> dict:
     con = _new_conn()
     try:
         if mode == "exact":
-            sql = (f"SELECT user_id, phone, indexed_at FROM people "
+            sql = (f"SELECT {SELECT_COLS} FROM people "
                    f"WHERE CAST({field} AS VARCHAR) = '{v}' LIMIT {limit}")
         elif mode == "contains":
             v2 = v.replace("%", r"\%").replace("_", r"\_")
-            sql = (f"SELECT user_id, phone, indexed_at FROM people "
-                   f"WHERE CAST({field} AS VARCHAR) ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit}")
+            sql = (f"SELECT {SELECT_COLS} FROM people "
+                   f"WHERE CAST({field} AS VARCHAR) ILIKE '%{v2}%' "
+                   f"ESCAPE '\\' LIMIT {limit}")
         else:
             raise ValueError(f"Unknown mode: {mode}")
         rows = _rows_to_dicts(con, con.execute(sql).fetchall())
@@ -188,7 +221,6 @@ def field_search(field: str, value: str, mode: str, limit: int) -> dict:
 app = FastAPI(title="TGNew Search API")
 
 
-# Global exception handler: log the real error + return it as JSON
 @app.exception_handler(Exception)
 async def _unhandled(request, exc):
     tb = traceback.format_exc()
@@ -234,18 +266,14 @@ def health():
         con.close()
         return {"status": "ok", "rows": n}
     except Exception as e:
-        return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
+        return {"status": "error", "detail": str(e),
+                "traceback": traceback.format_exc()}
 
 
 @app.get("/debug")
 def debug():
-    """
-    Run this first if you get a 500. It returns the raw traceback
-    from DuckDB connection setup, extension loading, and view creation.
-    """
     out = {"parquet_url": PARQUET_URL}
 
-    # Step 1: basic DuckDB
     try:
         con = duckdb.connect()
         out["duckdb_version"] = duckdb.__version__
@@ -255,13 +283,12 @@ def debug():
         out["traceback"] = traceback.format_exc()
         return out
 
-    # Step 2: extensions
     try:
+        os.makedirs("/tmp/duckdb_ext", exist_ok=True)
+        os.makedirs("/tmp/duckdb_temp", exist_ok=True)
         con.execute("SET home_directory='/tmp'")
         con.execute("SET extension_directory='/tmp/duckdb_ext'")
         con.execute("SET temp_directory='/tmp/duckdb_temp'")
-        os.makedirs("/tmp/duckdb_ext", exist_ok=True)
-        os.makedirs("/tmp/duckdb_temp", exist_ok=True)
         con.execute("INSTALL httpfs;")
         con.execute("LOAD httpfs;")
         out["step2_httpfs"] = "ok"
@@ -271,7 +298,6 @@ def debug():
         con.close()
         return out
 
-    # Step 3: read remote parquet
     try:
         n = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{PARQUET_URL}')"
@@ -299,8 +325,8 @@ async def user_lookup(
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, lookup_by_user_id, user_id, limit)
     result = {"success": bool(data["count"]), **data}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
+    return Response(content=_dumps(result, pretty),
+                    media_type="application/json")
 
 
 @app.get("/phone/{phone}")
@@ -314,8 +340,8 @@ async def phone_lookup(
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, lookup_by_phone, phone, limit)
     result = {"success": bool(data["count"]), **data}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
+    return Response(content=_dumps(result, pretty),
+                    media_type="application/json")
 
 
 @app.get("/search")
@@ -330,12 +356,14 @@ async def search(
         raise HTTPException(422, "Provide q")
     loop = asyncio.get_running_loop()
     if field:
-        data = await loop.run_in_executor(None, field_search, field, q.strip(), mode, limit)
+        data = await loop.run_in_executor(
+            None, field_search, field, q.strip(), mode, limit
+        )
     else:
         data = await loop.run_in_executor(None, unified_search, q.strip(), limit)
     result = {"success": bool(data["count"]), **data, "total": data["count"]}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
+    return Response(content=_dumps(result, pretty),
+                    media_type="application/json")
 
 
 @app.post("/users/batch")
@@ -351,8 +379,7 @@ async def users_batch(req: BatchRequest):
     ]
     results = await asyncio.gather(*tasks)
     return Response(
-        content=json.dumps({"count": len(results), "results": list(results)},
-                           indent=2, ensure_ascii=False),
+        content=_dumps({"count": len(results), "results": list(results)}, True),
         media_type="application/json",
     )
 
@@ -387,10 +414,11 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=3):
                 q_in = gr.Textbox(label="Search Query",
-                                  placeholder="e.g. 989301897477 or 263493087", lines=1)
+                                  placeholder="e.g. 989301897477 or 263493087",
+                                  lines=1)
             with gr.Column(scale=1):
-                limit_slider = gr.Slider(minimum=1, maximum=100, value=20, step=1,
-                                         label="Max Results")
+                limit_slider = gr.Slider(minimum=1, maximum=100, value=20,
+                                         step=1, label="Max Results")
         btn = gr.Button("🔍 Search", variant="primary", size="lg")
         out = gr.Markdown(label="Results")
         btn.click(fn=ui_search, inputs=[q_in, limit_slider], outputs=out)
